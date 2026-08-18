@@ -131,7 +131,7 @@ else:
     if log_file_error:
         log.warning(log_file_error)
 
-__VERSION__ = "0.1.3"
+__VERSION__ = "0.1.4"
 MCP_NAME = "netmiko"
 MCPR_DIR = "mcpr"
 FALLBACK_COMMANDS_BY_PLATFORM: dict[str, list[str]] = {
@@ -1619,6 +1619,10 @@ def deny_check(command: str, denied_commands: list[str]) -> bool:
     return False
 
 
+class CommandPolicyError(Exception):
+    """The command file exists but cannot be used as a policy."""
+
+
 @lru_cache(maxsize=1)
 def load_commands() -> dict[str, Any]:
     """Load the allow/deny list from the configured command_file.
@@ -1639,8 +1643,20 @@ def load_commands() -> dict[str, Any]:
     file_path = Path(settings.command_file).expanduser()
     if file_path.is_file():
         commands = load_yaml_file(str(file_path))
-        if isinstance(commands, dict):
-            commands.pop("policy_source", None)
+        if not isinstance(commands, dict):
+            # An existing-but-unusable file is NOT the fallback. The fallback answers
+            # "nobody wrote a policy yet"; a 0-byte or malformed commands.yml answers
+            # "somebody wrote one and it is broken", and widening the allow list on
+            # the strength of a broken file is exactly the wrong reflex. Raising here
+            # keeps the invariant this function owns — it returns a mapping or nothing
+            # at all — so no caller has to defend against None. validate_startup()
+            # turns it into a startup error that names the file, and every tool then
+            # reports that instead of touching a device.
+            raise CommandPolicyError(
+                f"the file is empty or its top level is not a mapping "
+                f"(YAML parsed as {type(commands).__name__})"
+            )
+        commands.pop("policy_source", None)
         return commands
     return {
         "allowed_commands": list(FALLBACK_ALLOWED_COMMANDS),
