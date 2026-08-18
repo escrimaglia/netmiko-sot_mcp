@@ -1,0 +1,142 @@
+# Command allow / deny list.
+#
+# ############################################################################
+# THIS FILE IS A TEMPLATE. THE POLICY IS THE OPERATOR'S TO DEFINE.
+#
+# Which commands will be needed cannot be predicted: Netmiko supports more than
+# 400 device_types, every family has its own dialect, and the command is chosen
+# by whoever is operating. What follows is a conservative starting point, not a
+# list that aspires to be complete. Adapt it to the estate and to the policy of
+# each installation.
+# ############################################################################
+#
+# The full rules are in the README, "Security" section. The ones most often
+# forgotten:
+#
+#   - Default deny: if allowed_commands is empty, NOTHING is permitted.
+#   - deny always wins over allow.
+#   - The allow list does NOT cover abbreviations: "show version" does not
+#     enable "sh ver". The LLM must send complete commands.
+#   - The deny list DOES cover abbreviations with the same word count: denying
+#     "configure" also blocks "conf". That asymmetry is deliberate and it is the
+#     strong part of the model: what is dangerous is denied broadly, what is
+#     permitted is enabled precisely.
+#   - Glob: a single '*', always at the end.
+#       "show vlan*"   → the base command and anything that follows it.
+#       "show vlan *"  → only with at least one more argument, NOT the base alone.
+#
+# Commands are cached on first use: RESTART the server after editing.
+
+# ---------------------------------------------------------------------------
+# ALLOW — what may be executed
+#
+# Two strategies, pick one:
+#
+#  (A) Enumerate. Maximum control, has to be maintained by hand and extended
+#      every time a new command is needed. It is the default below.
+#
+#  (B) Enable the whole read verb and trust the deny list:
+#          - "show*"
+#          - "display*"        # Huawei VRP, HPE Comware
+#          - "get*"            # Junos PyEZ, F5
+#      Far more convenient and it covers any platform without touching the file,
+#      but the scope then depends entirely on the deny list being complete. If
+#      you choose this, review the deny list carefully: it is the only thing
+#      left between the agent and a 200,000-line "show tech-support".
+# ---------------------------------------------------------------------------
+
+allowed_commands:
+  # Basic status — works on most Cisco-like platforms.
+  - "show version"
+  - "show clock"
+  - "show inventory"
+  - "show interfaces*"
+  - "show ip interface*"
+  - "show ip route*"
+  - "show arp*"
+  - "show lldp neighbors*"
+  - "show cdp neighbors*"
+  - "show vlan*"
+  - "show logging*"
+  - "show processes cpu*"
+
+  # The 'display' dialect (Huawei VRP, HPE Comware). Without these entries, a
+  # device from those families is unusable even when it is in the inventory.
+  - "display version"
+  - "display clock"
+  - "display interface*"
+  - "display ip interface*"
+  - "display ip routing-table*"
+  - "display arp*"
+  - "display lldp neighbor*"
+  - "display cpu-usage*"
+
+  # Full configuration.
+  # CAREFUL: this dumps the entire configuration into the LLM's context and into
+  # the output file on disk — including password hashes, SNMP communities and
+  # pre-shared keys. Acceptable in a lab; decide explicitly before production.
+  - "show running-config"
+  - "show startup-config"
+  - "show configuration"
+  - "display current-configuration"
+
+# ---------------------------------------------------------------------------
+# DENY — what may never be executed
+#
+# Because deny covers abbreviations, "configure*" blocks 'conf t', 'config term'
+# and friends. Maintaining this list matters more than maintaining the allow
+# list: it is the one that keeps protecting if somebody widens allow with a
+# broad glob.
+#
+# BUT DO NOT ASSUME THIS LIST GENERALIZES!
+# The verbs below come from Cisco-like CLIs. Netmiko supports 177 base
+# device_types (416 with variants) from 102 vendors, and many look nothing alike:
+#
+#   MikroTik RouterOS  '/system reboot'      → "reboot*" does NOT catch it
+#   VyOS               'set …' / 'commit'    → different config verbs
+#   F5 tmsh            'modify' / 'create'   → there is no 'configure'
+#   Fortinet           'config system …'     → covered by "config*", luckily
+#   Palo Alto PAN-OS   'request restart …'   → covered by "request*"
+#
+# When adding a new family to the inventory, review THIS list against its real
+# CLI. A deny list that does not cover a platform's dialect does not protect
+# that device, and nothing warns you about it.
+# ---------------------------------------------------------------------------
+
+denied_commands:
+  # Configuration mode and state writes.
+  - "configure*"
+  - "config*"
+  - "write*"
+  - "save*"
+  - "commit*"
+  - "copy*"
+  - "erase*"
+  - "delete*"
+  - "format*"
+  - "rename*"
+
+  # Device restart and control.
+  - "reload*"
+  - "reboot*"
+  - "shutdown*"
+  - "halt*"
+  - "request*"          # Junos: 'request system reboot', 'request system halt'
+
+  # Commands that change state even though they look read-only.
+  - "clear*"            # 'clear counters', 'clear ip bgp *' resets BGP sessions
+  - "debug*"            # can take down a loaded device
+  - "undebug*"
+  - "test*"
+  - "monitor*"
+
+  # Huge outputs: they exhaust the context and take minutes to produce.
+  - "show tech-support*"
+  - "display diagnostic-information*"
+  - "show running-config all"
+
+  # Access to other systems from the device.
+  - "telnet*"
+  - "ssh*"
+  - "traceroute*"
+  - "ping*"

@@ -1,0 +1,57 @@
+# Inventory in netmiko_tools format — EXAMPLE DATA.
+#
+# Fictional devices on the RFC 5737 documentation ranges (192.0.2.0/24,
+# 198.51.100.0/24). Nothing here resolves to a real host: replace the whole file
+# with your own estate before using it.
+#
+# This is the inventory of flavor C (self-contained) and of DEGRADED MODE, the
+# one used with NETMIKO_MCP_INVENTORY_TYPE=yaml when the source of truth is
+# unavailable. When it backs a real deployment, regenerate it periodically from
+# the SoT: a backup holding stale addresses is worse than no backup at all,
+# because you find out while operating.
+#
+# Two kinds of top-level key:
+#
+#   <name>: {device_type, host}   a device. device_type MUST be a Netmiko
+#                                 device_type — the string ConnectHandler takes.
+#   <name>: [names…]              a group. Any tool that accepts a device also
+#                                 accepts a group name, and 'all' means every
+#                                 device in the file.
+#
+# It holds no credentials. Those are resolved at runtime from the environment.
+
+# --- Devices ---------------------------------------------------------------
+# Five entries, one per CLI dialect worth exercising: the Cisco-style 'show',
+# IOS-XR, Junos, Huawei's 'display' and Arista. Enough to tell whether the allow
+# list in commands.yml covers a platform before a real estate is loaded.
+
+CORE-RTR-01:
+  device_type: cisco_xr
+  host: 192.0.2.11
+EDGE-RTR-01:
+  device_type: cisco_ios
+  host: 192.0.2.31
+EDGE-RTR-02:
+  device_type: juniper_junos
+  host: 192.0.2.32
+BRANCH-A-RTR:
+  device_type: huawei_vrp
+  host: 198.51.100.11
+LAB-SW-01:
+  device_type: arista_eos
+  host: 198.51.100.201
+
+# --- Groups ----------------------------------------------------------------
+# A group is a list of device names. Use them to run one command across a set:
+#   netmiko.send_show_command_to_group(group="edge", command="show version")
+# 'all' is implicit and always means every device above.
+
+edge:
+- EDGE-RTR-01
+- EDGE-RTR-02
+
+# Devices whose CLI is not the Cisco-style 'show' dialect. Handy when checking
+# that the allow list covers 'display' and the Junos syntax too.
+non_cisco_dialects:
+- EDGE-RTR-02
+- BRANCH-A-RTR

@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "netmiko": {
+      "type": "stdio",
+      "command": "${CLAUDE_PROJECT_DIR:-.}/.venv/bin/python",
+      "args": [
+        "${CLAUDE_PROJECT_DIR:-.}/mcps/mcp_server_netmiko.py"
+      ],
+      "env": {
+        "NETMIKO_MCP_INVENTORY_TYPE": "yaml",
+        "NETMIKO_MCP_INVENTORY_FILE": "${CLAUDE_PROJECT_DIR:-.}/config/netmiko/inventory.yml",
+        "NETMIKO_MCP_COMMAND_FILE": "${CLAUDE_PROJECT_DIR:-.}/config/netmiko/commands.yml",
+        "NETMIKO_MCP_CREDENTIAL_SOURCE": "env",
+        "NETMIKO_MCP_SAVE_OUTPUT_DIR": "${CLAUDE_PROJECT_DIR:-.}/mcpr/netmiko",
+        "NETMIKO_MCP_AUDIT_LOG_FILE": "${CLAUDE_PROJECT_DIR:-.}/logs/netmiko-audit.jsonl",
+        "LOG_FILE": "${CLAUDE_PROJECT_DIR:-.}/logs/netmiko-mcp.log",
+        "LOG_LEVEL": "INFO"
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+claude-project — netmiko MCP server + skill
+Copyright (c) 2026 Ed Scrimaglia <edgardo.scrimaglia@gmail.com>
+
+This product includes software derived from netmiko_mcp
+(https://github.com/ktbyers/netmiko_mcp), Copyright (c) Kirk Byers, licensed
+under the Apache License, Version 2.0 (see LICENSE-APACHE-2.0).
+
+Modifications made to the derived work, as required by section 4(b) of that
+license:
+
+  - The command validation core (allow/deny matching, glob handling, character
+    filtering) was ported with its logic intact; identifiers lost their leading
+    underscore, e.g. `_invalid_glob_entries` became `invalid_glob_entries`.
+  - A dynamic inventory backend resolved against a REST source of truth was
+    added, alongside the original file-based inventory.
+  - Credential resolution from that source of truth was added, with local
+    Fernet decryption.
+  - Large command output is now written to disk and served paginated, instead of
+    being returned inline.
+  - A fail-closed JSON audit trail and structured logging were added.
+  - Tooling, packaging and configuration were reorganized for this project.
+
+Netmiko itself (https://github.com/ktbyers/netmiko), Copyright (c) Kirk Byers,
+is used as an unmodified dependency under the MIT License.
