@@ -282,6 +282,7 @@ type. Relay that reason instead of "not found".
 | `netmiko.send_show_command_to_group` | The same command across a group, concurrently. |
 | `netmiko.list_device_outputs` | Output already saved to disk. |
 | `netmiko.read_device_output` | Read a saved output, paginated. |
+| `netmiko.query_audit_trail` | What was done in the past: activity per device, refused commands, which credential was used. Reads records, never a device. |
 
 ### One device or a group?
 
@@ -429,6 +430,46 @@ Never summarise a partial run as if every device answered.
 
 ---
 
+## Reading the Audit Trail
+
+Every command attempt, every execution outcome and every credential resolution is
+recorded. `netmiko.query_audit_trail` reads those records. It answers questions
+about **what already happened** — it opens no connection and returns no device
+output, so it is also the cheap way to answer "did anyone touch that switch"
+without touching it.
+
+Turn what the user said into arguments. Do not fetch everything and sift.
+
+| The user asks | The call |
+|---|---|
+| "everything done on SW-CORE-01, by date" | `device="SW-CORE-01"`, `order="asc"` |
+| "the last 6 netmiko actions" | `limit=6` (desc is the default) |
+| "which commands were refused this week" | `verdict="DENIED"`, `since="<Monday>"` |
+| "how many commands per device this month" | `summary_by="device"`, `since="<1st>"` |
+| "why did that fail" | `event="connection_outcome"`, `device=...` — the `outcome` and `detail` are there |
+| "what happened in that one attempt" | `correlation_id=...`, which ties validation, credential and outcome together |
+| "did anyone read the audit" | `tool="netmiko.query_audit_trail"` |
+
+Four things about the response that change what you may claim:
+
+- **`matched` is the total; `returned` is this page.** When they differ you are
+  holding a slice. Never report `returned` as "there were N".
+- **`files_scanned` and `oldest_available` bound the answer.** The trail rotates
+  daily and only what is still on disk can be read. If the user asked about a
+  period older than `oldest_available`, say the records do not go back that far —
+  do **not** say nothing happened.
+- **Your own queries are hidden by default.** `audit_queries_hidden` counts them.
+  Pass `include_audit_queries=true` only when the question is about who read the
+  trail.
+- **A summary bucket named `(absent)` is not a device or an outcome** — it is the
+  records that do not carry that field, because a `tool_invocation` has no
+  `outcome` and a `credential_resolution` has no `verdict`. Add an `event` filter
+  to get a breakdown that means something.
+
+An argument the server does not recognise comes back as an error naming the valid
+options. Read it and re-issue; do not drop the filter and answer with everything,
+which would present unfiltered records as if they were the filtered ones.
+
 ## Anti-patterns
 
 1. Composing a command without checking the device's `device_type` first, then
@@ -448,6 +489,8 @@ Never summarise a partial run as if every device answered.
 11. Carrying a management address back from a source-of-truth lookup instead of
     the device name, or querying the source of truth at all when
     `inventory.backend` is `yaml`.
+12. Reading an empty audit result as "it never happened", when the period asked
+    about is older than `oldest_available` or outside `files_scanned`.
 
 ---
 

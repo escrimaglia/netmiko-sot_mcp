@@ -23,7 +23,7 @@ import sys
 import time
 import traceback
 import uuid
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -131,7 +131,7 @@ else:
     if log_file_error:
         log.warning(log_file_error)
 
-__VERSION__ = "0.1.4"
+__VERSION__ = "0.1.5"
 MCP_NAME = "netmiko"
 MCPR_DIR = "mcpr"
 FALLBACK_COMMANDS_BY_PLATFORM: dict[str, list[str]] = {
@@ -748,6 +748,416 @@ def save_channel_transcript(
 
     file_path.write_text(transcript_text, encoding="utf-8")
     file_path.chmod(0o600)
+
+
+AUDIT_DESTINATION_SYSLOG = "syslog"
+
+# Derivadas de las constantes de arriba a propósito: una lista escrita a mano se
+# desincroniza en silencio la primera vez que alguien agrega un OUTCOME_*, y el
+# filtro rechazaría un valor que el audit sí escribe.
+AUDIT_REASONS: tuple[str, ...] = (
+    REASON_UNSAFE_CHAR,
+    REASON_DENY_MATCH,
+    REASON_MULTIPLE_PIPES,
+    REASON_INVALID_PIPE_MODIFIER,
+    REASON_NO_ALLOW_MATCH,
+    REASON_ALLOWED,
+)
+
+AUDIT_OUTCOMES: tuple[str, ...] = (
+    OUTCOME_SUCCESS,
+    OUTCOME_AUTH_FAILURE,
+    OUTCOME_TIMEOUT,
+    OUTCOME_SSH_ERROR,
+    OUTCOME_NETMIKO_ERROR,
+    OUTCOME_READ_TIMEOUT,
+    OUTCOME_READ_ERROR,
+    OUTCOME_WRITE_ERROR,
+    OUTCOME_ERROR,
+    OUTCOME_INVENTORY_ERROR,
+    OUTCOME_CREDENTIAL_ERROR,
+    OUTCOME_SOT_ERROR,
+)
+
+AUDIT_EVENTS = (
+    "command_attempt",
+    "connection_outcome",
+    "tool_invocation",
+    "credential_resolution",
+)
+
+AUDIT_SUMMARY_KEYS = ("device", "tool", "outcome", "verdict", "event", "day")
+
+AUDIT_QUERY_TOOL_NAME = "netmiko.query_audit_trail"
+
+AUDIT_QUERY_MAX_LIMIT = 500
+
+
+class AuditQueryError(Exception):
+    """An audit query cannot be answered as asked.
+
+    Raised for an argument the caller got wrong, never for a record that simply
+    does not match. The distinction matters: a bad filter that returned an empty
+    list would read as "nothing happened", which is the one answer an audit trail
+    must never give by accident.
+    """
+
+
+def parse_audit_time(value: str, field: str) -> datetime:
+    """Parse an ISO 8601 timestamp from a tool argument, as aware UTC.
+
+    A bare date ('2026-08-17') means midnight UTC, which is what someone asking
+    "since the 17th" means. A naive datetime is read as UTC rather than local
+    time: every audit timestamp is written in UTC, so interpreting the query in
+    the server's timezone would silently shift the window.
+    """
+    raw = value.strip()
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise AuditQueryError(
+            f"{field}='{value}' is not an ISO 8601 date or datetime "
+            f"(expected '2026-08-17' or '2026-08-17T14:30:00Z')."
+        ) from exc
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def audit_file_day(path: Path, current_name: str) -> Optional[str]:
+    """The UTC day a rotated audit file holds, from its filename suffix.
+
+    TimedRotatingFileHandler names yesterday's file 'netmiko_audit.jsonl.2026-08-17'.
+    Returns None for the file currently being written, which holds today and has
+    no suffix, and for any suffix that is not a date — a stray file next to the
+    audit trail is skipped rather than guessed at.
+    """
+    if path.name == current_name:
+        return None
+    suffix = path.name[len(current_name):].lstrip(".")
+    try:
+        datetime.strptime(suffix, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return suffix
+
+
+def audit_files(since: Optional[datetime] = None) -> list[Path]:
+    """Audit files to scan in chronological order: rotated days first, live file last.
+
+    The order is not cosmetic. read_audit_records() keeps the tail of what it sees
+    in a bounded deque, so "the newest N records" is only the newest N if the
+    files are read oldest-first. Reading the live file first made a desc query
+    return the OLDEST page, which looked like a plausible answer and was wrong.
+
+    Rotation is daily. Inside Niko the handler is a TimedRotatingFileHandler with
+    backupCount=0, so every rotated day is kept and a query that only read the
+    live file would cover from midnight — useless for "what happened last week".
+    Standalone there is no rotation at all (FailClosedFileHandler; the operator
+    rotates with logrotate), so the list is usually one file.
+
+    Two guards, both deliberate:
+
+    - Every candidate must resolve inside the audit directory, the same check
+      read_saved_output() makes. Nothing here comes from the caller, but the
+      directory is operator-configured and may hold symlinks.
+    - When `since` is given, a rotated file whose day is entirely older is
+      dropped without being opened. That is what keeps a query bounded when
+      months of audit have accumulated.
+    """
+    audit_path = Path(settings.audit_log_file).expanduser()
+    directory = audit_path.parent
+    if not directory.is_dir():
+        return []
+
+    try:
+        base = directory.resolve()
+    except OSError:  # pragma: no cover — depende del entorno
+        return []
+
+    since_day = since.strftime("%Y-%m-%d") if since else None
+    selected: list[tuple[str, Path]] = []
+    for candidate in directory.glob(f"{audit_path.name}*"):
+        if not candidate.is_file():
+            continue
+        try:
+            if not candidate.resolve().is_relative_to(base):
+                log.warning(
+                    f"Audit query: skipping '{candidate.name}' — it resolves outside "
+                    f"the audit directory."
+                )
+                continue
+        except OSError:  # pragma: no cover — depende del entorno
+            continue
+        day = audit_file_day(candidate, audit_path.name)
+        if day is None and candidate.name != audit_path.name:
+            continue
+        if since_day and day is not None and day < since_day:
+            continue
+        # The live file has no date suffix and holds today, so it gets a sentinel
+        # that sorts after every rotated day.
+        selected.append((day or "9999-99-99", candidate))
+
+    return [entry[1] for entry in sorted(selected)]
+
+
+def audit_record_matches(record: dict[str, Any], filters: dict[str, str]) -> bool:
+    """Whether one audit record satisfies every active filter (AND).
+
+    `command_contains` is a case-insensitive substring; everything else is an
+    exact match on the field. A filter naming a field the record does not carry
+    excludes it — a tool_invocation has no 'verdict', so asking for DENIED must
+    not return it.
+    """
+    for field, wanted in filters.items():
+        if field == "command_contains":
+            if wanted.lower() not in str(record.get("command", "")).lower():
+                return False
+        elif str(record.get(field, "")) != wanted:
+            return False
+    return True
+
+
+def read_audit_records(
+    *,
+    filters: dict[str, str],
+    since: Optional[datetime],
+    until: Optional[datetime],
+    order: str,
+    limit: int,
+    summary_key: str = "",
+    exclude_tool: str = "",
+) -> dict[str, Any]:
+    """Stream the audit trail and return the matching records plus what was scanned.
+
+    Blocking I/O: call it through asyncio.to_thread.
+
+    With `summary_key` set this counts into a Counter as it goes and keeps no
+    records at all, so a summary is exact over the whole trail instead of over
+    the first page — "how many commands were refused this week" has to be a real
+    total, and it costs no memory to make it one.
+
+    Memory stays bounded in the listing path too: for order='desc' the newest
+    `limit` matches are kept in a deque, so a query over a large trail never
+    holds more than one page plus one line.
+
+    `exclude_tool` drops the records one tool wrote before anything else looks at
+    them, so they count towards neither `matched` nor the summary.
+
+    A line that is not valid JSON, or is JSON but not an object, is counted in
+    `malformed_lines` and skipped. Aborting would let one corrupt line — a
+    half-written record from a killed process — hide the entire history.
+    """
+    files = audit_files(since)
+    matched = 0
+    malformed = 0
+    oldest: Optional[str] = None
+    kept: deque[dict[str, Any]] = deque(maxlen=limit if order == "desc" else None)
+    counter: Counter[str] = Counter()
+    excluded = 0
+
+    for path in files:
+        try:
+            handle = path.open("r", encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise AuditQueryError(f"audit file '{path.name}' could not be read: {exc}") from exc
+        with handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    malformed += 1
+                    continue
+                if not isinstance(record, dict):
+                    malformed += 1
+                    continue
+
+                if exclude_tool and record.get("tool") == exclude_tool:
+                    excluded += 1
+                    continue
+
+                stamp = record.get("timestamp")
+                if isinstance(stamp, str) and (oldest is None or stamp < oldest):
+                    oldest = stamp
+                if since or until:
+                    try:
+                        when = datetime.fromisoformat(str(stamp))
+                    except ValueError:
+                        malformed += 1
+                        continue
+                    if when.tzinfo is None:
+                        when = when.replace(tzinfo=timezone.utc)
+                    if since and when < since:
+                        continue
+                    if until and when > until:
+                        continue
+
+                if not audit_record_matches(record, filters):
+                    continue
+
+                matched += 1
+                if summary_key:
+                    counter[audit_group_value(record, summary_key)] += 1
+                    continue
+                if order == "desc":
+                    kept.append(record)
+                elif len(kept) < limit:
+                    kept.append(record)
+
+    records = list(kept)
+    if order == "desc":
+        records.reverse()
+    return {
+        "records": records,
+        "summary": dict(counter.most_common()),
+        "matched": matched,
+        "excluded": excluded,
+        "malformed_lines": malformed,
+        "files_scanned": [path.name for path in files],
+        "oldest_available": oldest,
+    }
+
+
+def audit_group_value(record: dict[str, Any], key: str) -> str:
+    """The bucket one record falls into when summarizing by `key`.
+
+    'day' buckets by the UTC date of the timestamp. A record that does not carry
+    the field goes to '(absent)' instead of being dropped: a summary by device
+    that silently ignored the tool_invocation records would under-report the very
+    activity it claims to total, and the counts would not add up to `matched`.
+    """
+    if key == "day":
+        return str(record.get("timestamp", ""))[:10] or "(absent)"
+    return str(record.get(key, "")) or "(absent)"
+
+
+def validate_audit_choice(value: str, field: str, allowed: tuple[str, ...]) -> str:
+    """Return a stripped enumerated argument, or raise naming the valid options.
+
+    Rejecting is the point. Ignoring an unrecognised filter would return records
+    that look filtered and are not, and the caller would report that as fact.
+    """
+    cleaned = value.strip()
+    if not cleaned:
+        return ""
+    if cleaned not in allowed:
+        raise AuditQueryError(
+            f"{field}='{value}' is not valid. Options: {', '.join(allowed)}."
+        )
+    return cleaned
+
+
+def run_audit_query(
+    *,
+    event: str,
+    device: str,
+    tool: str,
+    command_contains: str,
+    verdict: str,
+    reason: str,
+    outcome: str,
+    correlation_id: str,
+    since: str,
+    until: str,
+    order: str,
+    limit: int,
+    summary_by: str,
+    include_audit_queries: bool,
+) -> dict[str, Any]:
+    """Validate the query arguments, run it, and shape the response payload.
+
+    Blocking: called through asyncio.to_thread by the tool. Kept separate from the
+    tool so the whole query surface is testable without going through FastMCP.
+    """
+    filters: dict[str, str] = {}
+    if e := validate_audit_choice(event, "event", AUDIT_EVENTS):
+        filters["event"] = e
+    if v := validate_audit_choice(verdict, "verdict", (ALLOWED, DENIED)):
+        filters["verdict"] = v
+    if r := validate_audit_choice(reason, "reason", AUDIT_REASONS):
+        filters["reason"] = r
+    if o := validate_audit_choice(outcome, "outcome", AUDIT_OUTCOMES):
+        filters["outcome"] = o
+    for field, value in (
+        ("device", device),
+        ("tool", tool),
+        ("correlation_id", correlation_id),
+        ("command_contains", command_contains),
+    ):
+        if value.strip():
+            filters[field] = value.strip()
+
+    order_clean = order.strip().lower() or "desc"
+    if order_clean not in ("asc", "desc"):
+        raise AuditQueryError(f"order='{order}' is not valid. Options: asc, desc.")
+
+    summary_key = validate_audit_choice(summary_by, "summary_by", AUDIT_SUMMARY_KEYS)
+
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise AuditQueryError(f"limit='{limit}' must be a positive integer.")
+    capped_limit = min(limit, AUDIT_QUERY_MAX_LIMIT)
+
+    since_dt = parse_audit_time(since, "since") if since.strip() else None
+    until_dt = parse_audit_time(until, "until") if until.strip() else None
+    if since_dt and until_dt and since_dt > until_dt:
+        raise AuditQueryError(
+            f"since='{since}' is later than until='{until}', so the window is empty."
+        )
+
+    # Querying the audit writes a tool_invocation of its own, so a few questions in
+    # "the last 6 actions" would be six audit queries. The record stays — who read
+    # the trail is part of the trail — but it is out of the answer unless the
+    # caller asks for it, or filters for it on purpose.
+    asked_for_self = filters.get("tool") == AUDIT_QUERY_TOOL_NAME
+    exclude_tool = "" if (include_audit_queries or asked_for_self) else AUDIT_QUERY_TOOL_NAME
+
+    result = read_audit_records(
+        filters=filters,
+        since=since_dt,
+        until=until_dt,
+        order=order_clean,
+        limit=capped_limit,
+        summary_key=summary_key,
+        exclude_tool=exclude_tool,
+    )
+
+    payload: dict[str, Any] = {
+        "success": True,
+        "matched": result["matched"],
+        "files_scanned": result["files_scanned"],
+        "oldest_available": result["oldest_available"],
+        "malformed_lines": result["malformed_lines"],
+        "filters_applied": filters or None,
+    }
+    if result["excluded"]:
+        payload["audit_queries_hidden"] = result["excluded"]
+    if since_dt:
+        payload["since"] = since_dt.isoformat()
+    if until_dt:
+        payload["until"] = until_dt.isoformat()
+
+    if summary_key:
+        # The counts are exact over every matching record, so there is no page to
+        # truncate and nothing for the caller to add up itself.
+        payload["summary_by"] = summary_key
+        payload["summary"] = result["summary"]
+        payload["truncated"] = False
+    else:
+        payload["records"] = result["records"]
+        payload["returned"] = len(result["records"])
+        payload["order"] = order_clean
+        payload["limit"] = capped_limit
+        payload["truncated"] = result["matched"] > len(result["records"])
+
+    if not result["files_scanned"]:
+        payload["note"] = (
+            f"No audit file was found at '{settings.audit_log_file}'. Nothing has been "
+            f"recorded yet, or the path is not the one the server writes to."
+        )
+    return payload
 
 
 @dataclass
@@ -3353,6 +3763,159 @@ async def read_device_output(
     return json_result(
         {"success": True, "device": device_name, "filename": filename, "content": content}
     )
+
+
+@mcp.tool(name=AUDIT_QUERY_TOOL_NAME)
+@check_startup_error
+async def query_audit_trail(
+    event: str = "",
+    device: str = "",
+    tool: str = "",
+    command_contains: str = "",
+    verdict: str = "",
+    reason: str = "",
+    outcome: str = "",
+    correlation_id: str = "",
+    since: str = "",
+    until: str = "",
+    order: str = "desc",
+    limit: int = 50,
+    summary_by: str = "",
+    include_audit_queries: bool = False,
+) -> str:
+    """
+    Read the audit trail: what this server was asked to do, and what happened.
+
+    Answers questions about PAST activity — "everything done on SW-CORE-01",
+    "the last 6 netmiko actions", "which commands were refused this week", "who
+    touched that switch and with which credential". It reads the audit records
+    only; it never opens a connection and never returns device output.
+
+    Every argument is a filter, combined with AND. Leave one empty to not filter
+    on it. Translate what the user asked into these arguments — do not ask for
+    everything and sift through it.
+
+    The audit trail rotates daily and this reads the rotated files too, but only
+    what is still on disk. `files_scanned` and `oldest_available` in the response
+    say how far back the answer actually reaches: if the period the user asked
+    about is older than that, say so instead of reporting "nothing happened".
+
+    `matched` is how many records satisfied the filters; `returned` is how many
+    came back in this call. When they differ, the response is one page — never
+    report `returned` as a total.
+
+    Calling this tool writes a `tool_invocation` record of its own — reading the
+    trail is itself auditable — but those records are hidden from the results by
+    default, so "the last 6 actions" is about the network and not about your own
+    questions. `audit_queries_hidden` says how many were left out.
+
+    Args:
+        event (str): Record type. One of command_attempt (a command was validated),
+            connection_outcome (an SSH attempt finished), tool_invocation (a tool
+            that touches no device was called), credential_resolution (which
+            credential was used).
+        device (str): Exact inventory device name, as netmiko.list_devices returns it.
+        tool (str): Full tool name, e.g. 'netmiko.send_show_command'.
+        command_contains (str): Case-insensitive substring of the command, e.g. 'running-config'.
+        verdict (str): ALLOWED or DENIED. Only command_attempt records carry it.
+        reason (str): Why a command was allowed or refused, e.g. DENY_MATCH, NO_ALLOW_MATCH.
+        outcome (str): How an execution ended, e.g. SUCCESS, AUTH_FAILURE, TIMEOUT.
+            Only connection_outcome records carry it.
+        correlation_id (str): Ties the validation, the credential and the outcome of
+            one single attempt together. Use it to reconstruct what happened in one case.
+        since (str): ISO 8601 date or datetime, UTC. '2026-08-17' means from midnight.
+        until (str): ISO 8601 date or datetime, UTC.
+        order (str): 'desc' (newest first, the default) or 'asc'.
+        limit (int): Maximum records to return. Defaults to 50, capped at 500.
+        summary_by (str): Return counts instead of records, grouped by one of
+            device, tool, outcome, verdict, event, day. Counts are exact over every
+            matching record, not over one page. Use it for "how many" questions so
+            a count does not cost hundreds of records. Combine it with an `event`
+            filter to avoid a large '(absent)' bucket: records of one type do not
+            carry the fields of another.
+        include_audit_queries (bool): Include this tool's own invocations. Defaults
+            to False. Set it to True only when the question is about who read the
+            audit trail.
+
+    Returns:
+        str: JSON with `records` (or `summary`), plus `returned`, `matched`,
+            `truncated`, `files_scanned`, `oldest_available` and `malformed_lines`.
+    """
+    log_tool_invocation(
+        tool=AUDIT_QUERY_TOOL_NAME,
+        arguments={
+            "event": event,
+            "device": device,
+            "tool": tool,
+            "command_contains": command_contains,
+            "verdict": verdict,
+            "reason": reason,
+            "outcome": outcome,
+            "correlation_id": correlation_id,
+            "since": since,
+            "until": until,
+            "order": order,
+            "limit": limit,
+            "summary_by": summary_by,
+            "include_audit_queries": include_audit_queries,
+        },
+    )
+
+    # Both of these would otherwise answer with an empty list, which reads as
+    # "nothing happened" when the truth is "there is nothing here to read".
+    if not settings.audit_log_enabled:
+        return json_result(
+            {
+                "success": False,
+                "error": (
+                    "Auditing is disabled (NETMIKO_MCP_AUDIT_LOG_ENABLED=false), so there "
+                    "is no audit trail to query. Nothing has been recorded."
+                ),
+            }
+        )
+    if settings.audit_log_destination == AUDIT_DESTINATION_SYSLOG:
+        return json_result(
+            {
+                "success": False,
+                "error": (
+                    f"The audit trail goes to syslog only "
+                    f"(NETMIKO_MCP_AUDIT_LOG_DESTINATION=syslog), so there is no local file "
+                    f"to query. Query it on the syslog collector, or set the destination to "
+                    f"'both' to keep a local copy."
+                ),
+            }
+        )
+
+    try:
+        payload = await asyncio.to_thread(
+            run_audit_query,
+            event=event,
+            device=device,
+            tool=tool,
+            command_contains=command_contains,
+            verdict=verdict,
+            reason=reason,
+            outcome=outcome,
+            correlation_id=correlation_id,
+            since=since,
+            until=until,
+            order=order,
+            limit=limit,
+            summary_by=summary_by,
+            include_audit_queries=include_audit_queries,
+        )
+    except AuditQueryError as exc:
+        log.warning(f"query_audit_trail rejected the query: {exc}")
+        return json_result({"success": False, "error": f"Audit Query Error: {exc}"})
+    except Exception as exc:  # noqa: BLE001 — la tool informa, no tumba el server
+        log.error(f"query_audit_trail failed: {exc}")
+        return json_result({"success": False, "error": f"Error reading the audit trail: {exc}"})
+
+    log.debug(
+        f"query_audit_trail: matched={payload['matched']} "
+        f"returned={payload.get('returned', 0)} files={len(payload['files_scanned'])}"
+    )
+    return json_result(payload)
 
 
 def validate_startup() -> str | None:

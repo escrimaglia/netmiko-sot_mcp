@@ -5,7 +5,7 @@ switches and firewalls over SSH**, through the Model Context Protocol.
 
 It ships two pieces and the wiring between them:
 
-- **`mcps/mcp_server_netmiko.py`** — a self-contained MCP server. Nine tools,
+- **`mcps/mcp_server_netmiko.py`** — a self-contained MCP server. Ten tools,
   every command validated against an operator-defined allow/deny list, output
   parsed into JSON with `ntc-templates`, and a fail-closed audit trail of every
   attempt.
@@ -15,6 +15,11 @@ It ships two pieces and the wiring between them:
 
 Nothing here writes to a device. The allow list is default-deny — an empty one
 permits nothing — and the deny side always wins over the allow side.
+
+Everything that happens goes into an audit trail, and `netmiko.query_audit_trail`
+makes it answerable in conversation: *"everything done on SW-CORE-01, by date"*,
+*"the last 6 actions"*, *"which commands were refused this week"*. With no UI in
+this project, that tool is the only way to read it.
 
 ## Authors and provenance
 
@@ -131,7 +136,7 @@ cp .env.example .env && $EDITOR .env                 # SSH credentials
 claude                                               # approve the project server
 ```
 
-Inside the session: `/mcp` lists the 9 tools, `/skills` confirms the skill was
+Inside the session: `/mcp` lists the 10 tools, `/skills` confirms the skill was
 loaded. First check, without touching the network:
 
 > which command policy is the netmiko MCP enforcing?
@@ -571,7 +576,7 @@ absolute path or a `~` is taken as written.
 | `NETMIKO_MCP_MAX_WORKERS` | `10` | concurrent connections in group commands |
 | `NETMIKO_MCP_SAVE_OUTPUT_DIR` | `~/.netmiko_mcp_tmp` outside Niko | buffer for large outputs |
 | `NETMIKO_MCP_SAVE_THRESHOLD` | `1000` | line count above which output is saved instead of returned inline |
-| `NETMIKO_MCP_AUDIT_LOG_FILE` | *(see the parent README)* | audit trail (JSON, fail-closed) |
+| `NETMIKO_MCP_AUDIT_LOG_FILE` | *(see the parent README)* | audit trail (JSON, fail-closed). Ask the agent to read it with `netmiko.query_audit_trail` |
 | `NETMIKO_MCP_CONFIG` | `~/.netmiko-mcp.yml` | path to a YAML config file holding these same settings |
 | `LOG_FILE` / `LOG_LEVEL` | `Niko.log` / `INFO` | operational log: stderr always, plus this rotating file (5 MB × 3, `0600`). `LOG_LEVEL` is stated at its default so the knob is where you look for it — set it to `DEBUG` and the device output lands in the log |
 
