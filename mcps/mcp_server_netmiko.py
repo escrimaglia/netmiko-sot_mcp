@@ -14,12 +14,12 @@ import base64
 import functools
 import io
 import json
-import threading
 import logging
 import logging.handlers
 import os
 import re
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -28,15 +28,16 @@ from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal, Optional, Tuple, Type, TypeVar
+from typing import Any, Literal, TypeVar
 
-from dotenv import load_dotenv
-from fastmcp.server import FastMCP
+import fastmcp
 import requests
 from cryptography.fernet import Fernet
+from dotenv import load_dotenv
+from fastmcp.server import FastMCP
 from netmiko import ConnectHandler
 from netmiko.base_connection import BaseConnection
 from netmiko.cli_tools.helpers import obtain_devices
@@ -63,6 +64,36 @@ PARENT_DIR = Path(__file__).resolve().parent.parent
 if str(PARENT_DIR) not in sys.path:
     sys.path.insert(0, str(PARENT_DIR))
 load_dotenv(PARENT_DIR / ".env", override=False)
+
+# --- Postura del transporte HTTP -------------------------------------------
+#
+# Niko elige el transporte, no este archivo: srvclass_general.py:907 arma
+# `mcp.run(transport='http', host=..., port=...)` y no pasa ningún flag más, así
+# que TODO lo demás queda en los defaults de fastmcp — y los tres relevantes
+# vienen en False. El endpoint queda entonces escuchando en 127.0.0.1:8011/mcp
+# sin bearer token (invariante: el sondeo de arranque de Niko va sin headers, con
+# auth activa daría 401 y Niko concluiría que el server no levantó).
+#
+# Se fijan acá y NO como campos de McpConfig: test_transport_fields_are_gone
+# prohíbe que reaparezcan campos de transporte, porque reabrirían la puerta al
+# bearer token. Ninguno de estos tres agrega headers, así que no cae en eso.
+#
+# host_origin_protection: sin token, la validación de Host/Origin es la única
+#   defensa contra DNS rebinding — una página en el browser del operador resuelve
+#   su propio dominio a 127.0.0.1 y, siendo same-origin para el browser, llega al
+#   endpoint sin CORS de por medio y lee la respuesta. El Host ajeno es el único
+#   rastro que deja. En "auto" el guard valida Host porque el bind es loopback
+#   (permitidos: 127.0.0.1, localhost, ::1 y el host del bind) y responde 421 al
+#   ajeno; el Origin sólo se valida SI el header viene, así que un cliente que no
+#   es un browser —el de Niko— no lo nota. El default de fastmcp es False "for
+#   compatibility": es un opt-in, no algo que ya estuviera puesto.
+# stateless_http: un proceso local con un solo cliente no gana nada guardando
+#   estado de sesión, y sí paga que un reinicio del server invalide la sesión.
+# json_response: cada tool devuelve un resultado único (la salida grande se
+#   pagina en disco), así que el framing SSE no aporta y estorba al diagnosticar.
+fastmcp.settings.http_host_origin_protection = "auto"
+fastmcp.settings.stateless_http = True
+fastmcp.settings.json_response = True
 
 
 def resolve_project_path(value: str) -> Path:
@@ -104,7 +135,7 @@ else:
     # stderr y nunca a stdout — stdout ES el canal JSON-RPC del transporte
     # stdio, y una línea suelta ahí rompe la sesión.
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
-    log_file_error: Optional[str] = None
+    log_file_error: str | None = None
     log_file_setting = (os.getenv("LOG_FILE") or "").strip()
     if log_file_setting:
         log_path = resolve_project_path(log_file_setting)
@@ -131,7 +162,13 @@ else:
     if log_file_error:
         log.warning(log_file_error)
 
-__VERSION__ = "0.1.5"
+__VERSION__ = "0.1.6"
+# Revisión de ktbyers/netmiko_mcp contra la que se diffea la §7 SECURITY. Al
+# traer un parche de upstream, esa sección se revisa primero y se mantiene
+# literal. Verificado contra 951dfef: el único cambio en security.py desde
+# 2c05ff6 es cosmético (comillas de las forward refs de TrieNode), así que §7
+# está al día sin parche funcional pendiente.
+__UPSTREAM__ = "951dfef"
 MCP_NAME = "netmiko"
 MCPR_DIR = "mcpr"
 FALLBACK_COMMANDS_BY_PLATFORM: dict[str, list[str]] = {
@@ -180,7 +217,7 @@ def default_audit_log_file() -> str:
     if NIKO_AVAILABLE:
         try:
             return str(MCPLogging.resolve_log_dir() / "netmiko_audit.jsonl")
-        except Exception as exc:  # pragma: no cover — depende del entorno
+        except Exception as exc:  # noqa: BLE001 — un helper de Niko ausente o distinto no puede tumbar el arranque  # pragma: no cover — depende del entorno
             log.warning(
                 f"Audit: could not resolve Niko's log directory ({exc}); "
                 f"the audit trail goes to the home directory."
@@ -211,7 +248,7 @@ def resolve_niko_dir(helper_name: str, fallback: Callable[[], Path], label: str)
     try:
         helper = getattr(NikoPaths, helper_name, None)
         return Path(helper(MCP_NAME)) if helper is not None else fallback()
-    except Exception as exc:  # pragma: no cover — depende del entorno
+    except Exception as exc:  # noqa: BLE001 — un helper de Niko ausente o distinto no puede tumbar el arranque  # pragma: no cover — depende del entorno
         log.warning(
             f"Could not resolve Niko's '{label}' directory ({exc}); "
             f"falling back to the home directory default."
@@ -292,12 +329,12 @@ class McpConfig(BaseSettings):
     )
 
     inventory_type: Literal["netmiko_tools", "yaml", "fedele"] = Field(default="netmiko_tools")
-    inventory_file: Optional[str] = Field(default=None)
+    inventory_file: str | None = Field(default=None)
 
     credential_source: Literal["env", "fedele"] = Field(default="env")
 
     fedele_group_source: Literal["tags", "device_roles", "sites"] = Field(default="tags")
-    fedele_device_filter: Optional[str] = Field(default=None)
+    fedele_device_filter: str | None = Field(default=None)
     fedele_cache_ttl: int = Field(default=60)
 
     command_file: str = Field(default_factory=default_command_file)
@@ -307,7 +344,7 @@ class McpConfig(BaseSettings):
     )
     pipe_modifiers: list[str] = Field(default=["include", "exclude", "section", "begin", "count"])
 
-    ssh_config_file: Optional[str] = Field(default=None)
+    ssh_config_file: str | None = Field(default=None)
 
     max_workers: int = Field(default=10)
     save_output_dir: str = Field(default_factory=default_save_output_dir)
@@ -367,12 +404,12 @@ class McpConfig(BaseSettings):
     @classmethod
     def settings_customise_sources(
         cls,
-        settings_cls: Type[BaseSettings],
+        settings_cls: type[BaseSettings],
         init_settings: PydanticBaseSettingsSource,
         env_settings: PydanticBaseSettingsSource,
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
-    ) -> Tuple[PydanticBaseSettingsSource, ...]:
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
         """Orden de precedencia: init > entorno > YAML.
 
         Las variables NETMIKO_MCP_* siempre ganan sobre el archivo de config.
@@ -464,7 +501,7 @@ class AuditJsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         data: dict[str, Any] = {
-            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "timestamp": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
             "level": record.levelname,
         }
         for key, value in record.__dict__.items():
@@ -523,7 +560,7 @@ def build_file_handler(formatter: logging.Formatter) -> logging.Handler:
                 force_sync=True,
                 encoding="utf-8",
             )
-        except Exception as exc:  # pragma: no cover — depende del entorno
+        except Exception as exc:  # noqa: BLE001 — si el handler de Niko no sirve, se cae al de la stdlib  # pragma: no cover — depende del entorno
             log.warning(
                 f"Audit: could not use Niko's concurrent handler ({exc}); "
                 f"falling back to FileHandler."
@@ -643,7 +680,7 @@ def log_connection_outcome(
     device: str,
     command: str,
     outcome: str,
-    detail: Optional[str] = None,
+    detail: str | None = None,
     textfsm_parse_failed: bool = False,
 ) -> None:
     """Registro de auditoría del resultado de la conexión y ejecución.
@@ -739,7 +776,7 @@ def save_channel_transcript(
     transcript_dir.mkdir(parents=True, exist_ok=True)
     transcript_dir.chmod(0o700)
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     safe_device = "".join(c if c.isalnum() or c in "-_." else "_" for c in device_name)
     filename = f"{timestamp}_{correlation_id}_{safe_device}.txt"
     file_path = transcript_dir / filename
@@ -820,11 +857,11 @@ def parse_audit_time(value: str, field: str) -> datetime:
             f"(expected '2026-08-17' or '2026-08-17T14:30:00Z')."
         ) from exc
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
-def audit_file_day(path: Path, current_name: str) -> Optional[str]:
+def audit_file_day(path: Path, current_name: str) -> str | None:
     """The UTC day a rotated audit file holds, from its filename suffix.
 
     TimedRotatingFileHandler names yesterday's file 'netmiko_audit.jsonl.2026-08-17'.
@@ -836,13 +873,13 @@ def audit_file_day(path: Path, current_name: str) -> Optional[str]:
         return None
     suffix = path.name[len(current_name):].lstrip(".")
     try:
-        datetime.strptime(suffix, "%Y-%m-%d")
+        datetime.strptime(suffix, "%Y-%m-%d")  # noqa: DTZ007 — sólo valida que el sufijo sea una fecha; el datetime se descarta
     except ValueError:
         return None
     return suffix
 
 
-def audit_files(since: Optional[datetime] = None) -> list[Path]:
+def audit_files(since: datetime | None = None) -> list[Path]:
     """Audit files to scan in chronological order: rotated days first, live file last.
 
     The order is not cosmetic. read_audit_records() keeps the tail of what it sees
@@ -921,8 +958,8 @@ def audit_record_matches(record: dict[str, Any], filters: dict[str, str]) -> boo
 def read_audit_records(
     *,
     filters: dict[str, str],
-    since: Optional[datetime],
-    until: Optional[datetime],
+    since: datetime | None,
+    until: datetime | None,
     order: str,
     limit: int,
     summary_key: str = "",
@@ -951,7 +988,7 @@ def read_audit_records(
     files = audit_files(since)
     matched = 0
     malformed = 0
-    oldest: Optional[str] = None
+    oldest: str | None = None
     kept: deque[dict[str, Any]] = deque(maxlen=limit if order == "desc" else None)
     counter: Counter[str] = Counter()
     excluded = 0
@@ -989,7 +1026,7 @@ def read_audit_records(
                         malformed += 1
                         continue
                     if when.tzinfo is None:
-                        when = when.replace(tzinfo=timezone.utc)
+                        when = when.replace(tzinfo=UTC)
                     if since and when < since:
                         continue
                     if until and when > until:
@@ -1002,7 +1039,7 @@ def read_audit_records(
                 if summary_key:
                     counter[audit_group_value(record, summary_key)] += 1
                     continue
-                if order == "desc":
+                if order == "desc":  # noqa: SIM114 — las ramas dicen cosas distintas: en desc se guarda todo y se recorta después
                     kept.append(record)
                 elif len(kept) < limit:
                     kept.append(record)
@@ -1189,7 +1226,7 @@ class CommandAuditContext:
     def log_outcome(
         self,
         outcome: str,
-        detail: Optional[str] = None,
+        detail: str | None = None,
         textfsm_parse_failed: bool = False,
     ) -> None:
         """Emite el registro connection_outcome de esta invocación."""
@@ -1732,12 +1769,12 @@ class TrieNode:
     """
 
     def __init__(self) -> None:
-        self.children: dict[str, "TrieNode"] = {}
+        self.children: dict[str, TrieNode] = {}
         self.word_end: bool = False
         self.final_word: bool = False
         self.glob_suffix: bool = False
         self.glob_next_word: bool = False
-        self.next_word_trie: "TrieNode | None" = None
+        self.next_word_trie: TrieNode | None = None
 
 
 class AbbreviationDenyFilter:
@@ -2323,8 +2360,8 @@ class YamlInventoryBackend:
         if settings.inventory_file:
             path = Path(settings.inventory_file).expanduser()
             if path.is_file():
-                mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-                age_days = (datetime.now(timezone.utc) - mtime).days
+                mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+                age_days = (datetime.now(UTC) - mtime).days
                 info["last_modified"] = mtime.isoformat()
                 info["age_days"] = age_days
                 if age_days > 30:
@@ -2503,7 +2540,10 @@ class FedeleInventoryBackend:
         if cached is not None:
             return list(cached)
         records = self.get_paginated(self.group_endpoint, {})
-        groups = sorted({r.get("slug") for r in records if r.get("slug")})
+        # El walrus deja el filtro y el valor en un solo lookup, y hace explícito
+        # que lo que entra al set ya pasó por el guard: con dos `.get()` separados
+        # el tipo seguía siendo `Any | None` aunque en runtime nunca lo fuera.
+        groups = sorted({slug for r in records if (slug := r.get("slug"))})
         self.cache.set(("groups",), groups)
         return list(groups)
 
@@ -2922,7 +2962,7 @@ def run_show_command(
             except NetmikoBaseException as e:
                 audit_context.log_outcome(OUTCOME_NETMIKO_ERROR, detail=str(e))
                 return f"Connection Error: {str(e)}"
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — el server no revienta por un error de ejecución: lo audita y lo devuelve
                 audit_context.log_outcome(OUTCOME_ERROR, detail=traceback.format_exc())
                 return f"Execution Error: An unexpected error occurred: {str(e)}"
 
@@ -2964,7 +3004,7 @@ def run_show_command(
     except NetmikoBaseException as e:
         audit_context.log_outcome(OUTCOME_NETMIKO_ERROR, detail=str(e))
         return f"Connection Error: {str(e)}"
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — el server no revienta por un error de ejecución: lo audita y lo devuelve
         audit_context.log_outcome(OUTCOME_ERROR, detail=traceback.format_exc())
         return f"Execution Error: An unexpected error occurred: {str(e)}"
 
@@ -3032,7 +3072,7 @@ def save_device_output(device_name: str, command: str, output: Any) -> str:
     device_dir.chmod(0o700)
 
     cmd_name = sanitize_command_for_filename(command)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     file_path = device_dir / f"{cmd_name}_{timestamp}.txt"
     content = json.dumps(output, indent=2) if isinstance(output, (list, dict)) else str(output)
     file_path.write_text(content, encoding="utf-8")
@@ -3101,7 +3141,7 @@ def read_saved_output(
                 f"Security Error: Path resolves outside restricted directory "
                 f"(device: {device_name}, file: {filename})"
             )
-    except Exception:  # pragma: no cover
+    except Exception:  # noqa: BLE001 — cualquier falla resolviendo el path se trata como intento de escape  # pragma: no cover
         return (
             f"Security Error: Path resolves outside restricted directory "
             f"(device: {device_name}, file: {filename})"
@@ -3203,7 +3243,7 @@ def run_show_command_on_group(
                     results[device_name] = f"Output saved as '{saved_filename}'."
                 else:
                     results[device_name] = output
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — una falla en un equipo no puede abortar el resto del grupo
                 results[device_name] = f"Execution Error: {str(e)}"
 
     return results
@@ -3218,7 +3258,15 @@ except ImportError:
         return payload
 
 
-mcp = FastMCP("mcp-netmiko")
+# `version` e `instructions` viajan en el serverInfo del handshake `initialize`.
+# Sin ellos la versión sólo se alcanza llamando a netmiko.get_metadata, que es
+# una tool: para saber qué está corriendo hay que hablar con el server en vez de
+# leer lo que ya declaró al conectarse.
+mcp = FastMCP(
+    name="mcp-netmiko",
+    instructions="Read-only access to network devices over SSH via Netmiko.",
+    version=__VERSION__,
+)
 
 NETMIKO_CORE_FIELDS: frozenset[str] = frozenset(
     {
@@ -3252,7 +3300,7 @@ def json_result(payload: Any) -> str:
     return json.dumps(payload, default=str)
 
 
-def check_startup_error(func: ToolFunc) -> ToolFunc:
+def check_startup_error(func: ToolFunc) -> ToolFunc:  # noqa: UP047 — TypeVar y no PEP695: mantiene la forma de upstream en el decorador
     """Corta la tool y devuelve startup_error si el arranque falló.
 
     Se aplica debajo de @mcp.tool() en cada tool, para que un servidor mal
@@ -3878,10 +3926,10 @@ async def query_audit_trail(
             {
                 "success": False,
                 "error": (
-                    f"The audit trail goes to syslog only "
-                    f"(NETMIKO_MCP_AUDIT_LOG_DESTINATION=syslog), so there is no local file "
-                    f"to query. Query it on the syslog collector, or set the destination to "
-                    f"'both' to keep a local copy."
+                    "The audit trail goes to syslog only "
+                    "(NETMIKO_MCP_AUDIT_LOG_DESTINATION=syslog), so there is no local file "
+                    "to query. Query it on the syslog collector, or set the destination to "
+                    "'both' to keep a local copy."
                 ),
             }
         )
@@ -3970,7 +4018,7 @@ def validate_startup() -> str | None:
     load_commands.cache_clear()
     try:
         commands = load_commands()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — el motivo llega al operador como Startup Error, no como traceback
         return (
             f"Startup Error: command_file '{settings.command_file}' could not be read: {exc}. "
             f"Fix the file, or remove it to fall back to the built-in read-only commands."
@@ -4064,19 +4112,19 @@ def log_effective_config() -> None:
 try:
     configure_audit_logger()
     startup_error = validate_startup()
-except Exception as exc:
+except Exception as exc:  # noqa: BLE001 — la §11 nunca muere al importar: eso se ve igual que no haber arrancado
     startup_error = f"Startup Error: could not configure auditing: {exc}"
 
 if not startup_error:
     try:
         startup_warning = command_policy_warning()
-    except Exception as exc:  # pragma: no cover — depende del entorno
+    except Exception as exc:  # noqa: BLE001 — la §11 nunca muere al importar: eso se ve igual que no haber arrancado  # pragma: no cover — depende del entorno
         startup_warning = None
         log.warning(f"Could not determine the command policy source: {exc}")
 
 try:
     log_effective_config()
-except Exception as exc:  # pragma: no cover — un log no puede tumbar el arranque
+except Exception as exc:  # noqa: BLE001 — un log no puede tumbar el arranque  # pragma: no cover — un log no puede tumbar el arranque
     log.warning(f"Could not log the effective configuration: {exc}")
 
 if startup_error:

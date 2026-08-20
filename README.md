@@ -499,8 +499,12 @@ guard, so HTTP is served by the FastMCP CLI instead — no code change:
 ```bash
 .venv/bin/fastmcp run mcps/mcp_server_netmiko.py \
   --transport http --host 127.0.0.1 --port 8123
-# endpoint: http://127.0.0.1:8123/mcp/
+# endpoint: http://127.0.0.1:8123/mcp
 ```
+
+The path has no trailing slash: `/mcp` is the route FastMCP registers, and
+`/mcp/` answers `307` to it. Clients follow the redirect, so an old config with
+the slash still works — it just pays a round trip on every request.
 
 The `NETMIKO_MCP_*` variables are no longer part of the client config: the
 server process is started by you, so they belong to *its* environment (a shell
@@ -513,7 +517,7 @@ Client side:
   "mcpServers": {
     "netmiko": {
       "type": "http",
-      "url": "http://127.0.0.1:8123/mcp/",
+      "url": "http://127.0.0.1:8123/mcp",
       "headers": {
         "Authorization": "Bearer ${NETMIKO_MCP_TOKEN}"
       }
@@ -522,7 +526,7 @@ Client side:
 }
 ```
 
-Or, equivalently, `claude mcp add --transport http netmiko http://127.0.0.1:8123/mcp/`.
+Or, equivalently, `claude mcp add --transport http netmiko http://127.0.0.1:8123/mcp`.
 
 `--transport sse` and `"type": "sse"` also work; SSE is the older remote
 transport and is kept for clients that have not moved to streamable HTTP.
@@ -533,6 +537,20 @@ transport and is kept for clients that have not moved to streamable HTTP.
 > local test, and for anything shared put it behind a reverse proxy that
 > terminates TLS and checks the `Authorization` header. The `headers` block
 > above is what the client sends; the proxy is what has to verify it.
+>
+> Binding to loopback is not by itself enough, which is why the server sets
+> `http_host_origin_protection = "auto"` at import (§1). A page open in your
+> browser can point its own domain at `127.0.0.1` and reach the port: to the
+> browser that is same-origin, so no CORS applies and its JavaScript reads the
+> response — needing no credentials, since the server holds them and asks the
+> client for nothing. The foreign `Host` header is the only trace it leaves. With
+> the guard on, a foreign `Host` gets **421** and a foreign `Origin` gets **403**,
+> while a legitimate localhost request is served. It costs nothing client-side: a
+> non-browser client sends no `Origin` at all, so that half is never evaluated.
+>
+> The server also sets `stateless_http` and `json_response` to `True`, so each
+> request stands alone and is answered with a single `application/json` body
+> instead of an SSE stream. Both are `False` by default in FastMCP.
 
 ## Non-Claude agents
 

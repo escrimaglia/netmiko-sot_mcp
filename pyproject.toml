@@ -1,15 +1,23 @@
 [project]
 name = "claude-project-netmiko"
-version = "0.1.5"
+version = "0.1.6"
 description = "Example project: netmiko MCP server + netmiko skill, run by Claude Code"
 requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE", "LICENSE-APACHE-2.0", "NOTICE"]
 authors = [{ name = "Ed Scrimaglia", email = "edgardo.scrimaglia@gmail.com" }]
 dependencies = [
+    # cryptography y paramiko se importan DIRECTAMENTE en el servidor (Fernet para
+    # descifrar las credenciales del SoT, SSHException para el manejo de errores
+    # de conexión). Llegaban por transitividad de netmiko: sin declararlas, la
+    # versión que sostiene el acceso a credenciales la elige el resolver.
+    # paramiko se topea en <5.0 igual que netmiko: 5.x quitó SHA-1 y eso rompe la
+    # conectividad con equipos legacy.
+    "cryptography>=50.0.0",
     "fastmcp>=3.3.1",
     "netmiko>=4.7.0",
     "ntc-templates>=4.1.0",
+    "paramiko>=4.0.0,<5.0",
     "pydantic-settings>=2.14.1",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",
