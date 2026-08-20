@@ -30,6 +30,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
+from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -91,9 +92,62 @@ load_dotenv(PARENT_DIR / ".env", override=False)
 #   estado de sesión, y sí paga que un reinicio del server invalide la sesión.
 # json_response: cada tool devuelve un resultado único (la salida grande se
 #   pagina en disco), así que el framing SSE no aporta y estorba al diagnosticar.
-fastmcp.settings.http_host_origin_protection = "auto"
-fastmcp.settings.stateless_http = True
-fastmcp.settings.json_response = True
+TRANSPORT_POSTURE: dict[str, object] = {
+    "http_host_origin_protection": "auto",
+    "stateless_http": True,
+    "json_response": True,
+}
+
+# Qué se pierde si la versión instalada de fastmcp no define el campo. El aviso
+# tiene que nombrar la consecuencia, no el nombre del campo: "no expone X" no le
+# dice a un operador si eso lo deja expuesto o si da igual.
+TRANSPORT_POSTURE_IF_MISSING: dict[str, str] = {
+    "http_host_origin_protection": (
+        "el endpoint HTTP no valida Host ni Origin, así que un endpoint sin bearer "
+        "token queda sin defensa contra DNS rebinding"
+    ),
+    "stateless_http": "el transporte HTTP mantiene estado de sesión por cliente",
+    "json_response": "las respuestas HTTP salen como stream SSE en vez de JSON",
+}
+
+# Los avisos se juntan acá porque `log` todavía no existe: la configuración del
+# logging necesita PARENT_DIR y el .env, que se resuelven arriba. Se emiten más
+# abajo, con el mismo patrón que log_file_error.
+transport_posture_warnings: list[str] = []
+
+
+def apply_transport_posture() -> None:
+    """Fija la postura del transporte tolerando que fastmcp no tenga un campo.
+
+    `fastmcp.settings` valida en la asignación, así que escribir un campo que esa
+    versión no define levanta ValidationError. Hecho al importar, eso MATA el
+    proceso — y del lado de Niko un proceso muerto al importar se ve idéntico a
+    uno que nunca arrancó: `Off` en la UI y nada más. Pasó de verdad: fastmcp
+    3.4.2 no tiene `http_host_origin_protection` (3.4.7 sí), y el server no
+    levantaba.
+
+    Un campo ausente se saltea con un aviso, nunca con una excepción. El aviso no
+    es cosmético: si la protección de Host/Origin no está disponible, el operador
+    tiene que saber que ESE endpoint sin bearer token quedó sin defensa contra DNS
+    rebinding, en vez de suponerla activa porque el archivo la pide.
+    """
+    known = set(type(fastmcp.settings).model_fields)
+    for name, value in TRANSPORT_POSTURE.items():
+        if name not in known:
+            transport_posture_warnings.append(
+                f"fastmcp {FASTMCP_VERSION} no define '{name}', así que "
+                f"{TRANSPORT_POSTURE_IF_MISSING[name]}. Actualizar a fastmcp>=3.4.7."
+            )
+            continue
+        setattr(fastmcp.settings, name, value)
+
+
+try:
+    FASTMCP_VERSION = pkg_version("fastmcp")
+except PackageNotFoundError:  # pragma: no cover — depende del entorno
+    FASTMCP_VERSION = "desconocida"
+
+apply_transport_posture()
 
 
 def resolve_project_path(value: str) -> Path:
@@ -162,7 +216,11 @@ else:
     if log_file_error:
         log.warning(log_file_error)
 
-__VERSION__ = "0.1.6"
+# Lo que apply_transport_posture() no pudo fijar, ahora que hay dónde decirlo.
+for posture_warning in transport_posture_warnings:
+    log.warning(f"Transport: {posture_warning}")
+
+__VERSION__ = "0.1.7"
 # Revisión de ktbyers/netmiko_mcp contra la que se diffea la §7 SECURITY. Al
 # traer un parche de upstream, esa sección se revisa primero y se mantiene
 # literal. Verificado contra 951dfef: el único cambio en security.py desde

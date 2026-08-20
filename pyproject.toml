@@ -1,6 +1,6 @@
 [project]
 name = "claude-project-netmiko"
-version = "0.1.6"
+version = "0.1.7"
 description = "Example project: netmiko MCP server + netmiko skill, run by Claude Code"
 requires-python = ">=3.12"
 license = "MIT"
