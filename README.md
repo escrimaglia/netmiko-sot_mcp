@@ -161,7 +161,7 @@ the config file:
 
 ```json
 {
-  "inventory": {"backend": "fedele", "scope_filter": {"tag": "lab"}, "available": true},
+  "inventory": {"backend": "fedele", "scope_filter": null, "available": true},
   "credential_source": "env",
   "device_types_in_inventory": ["cisco_ios", "huawei_vrp", "…"]
 }
@@ -177,10 +177,9 @@ no file to edit and no restart.
 ```jsonc
 // .mcp.json → env
 "NETMIKO_MCP_INVENTORY_TYPE": "fedele",
-"NETMIKO_MCP_CREDENTIAL_SOURCE": "fedele",
-"NETMIKO_MCP_FEDELE_GROUP_SOURCE": "tags",        // tags | device_roles | sites
-"NETMIKO_MCP_FEDELE_DEVICE_FILTER": "tag=lab",    // the scope filter — read the warning
-"NETMIKO_MCP_FEDELE_CACHE_TTL": "60"
+"NETMIKO_MCP_CREDENTIAL_SOURCE": "fedele"
+// GROUP_SOURCE (tags), DEVICE_FILTER (none) and CACHE_TTL (60s) keep their
+// defaults — the table below has them if you need to override one
 ```
 
 ```bash
@@ -212,10 +211,16 @@ Things worth knowing before you pick this flavor:
 - Without `FEDELE_CREDENTIALS_KEY` the server still starts, and **every** tool
   returns the same `Startup Error` naming the missing variable. It fails loudly,
   not silently.
-- **Set the scope filter.** Without `NETMIKO_MCP_FEDELE_DEVICE_FILTER` the
-  inventory is the entire estate the SoT knows about, which is also the entire
-  set of devices the agent can reach. The server logs a warning when it is
-  missing; the filter takes query syntax, `tag=lab&status=active`.
+- **The inventory is the whole estate unless you scope it.** With no
+  `NETMIKO_MCP_FEDELE_DEVICE_FILTER` the agent can reach every device the SoT
+  exposes to your token, across every tenant. Running that way is a supported
+  posture, not a misconfiguration — the containment is then `commands.yml`,
+  *which commands* are allowed rather than *which devices* are reachable. The
+  server still logs a warning at startup and returns one in
+  `netmiko.get_metadata`; unscoped, that pair is expected output. To narrow it,
+  the filter takes query syntax: `tag=lab&status=active`. One caveat if you do:
+  it filters devices only — group listings are queried unfiltered, so
+  `netmiko.list_groups` stays global either way.
 - A device without a `primary_ip`, without a `platform`, or whose platform is
   not a Netmiko `device_type` is **excluded** from the inventory — SoTs also
   inventory cameras, badge readers and chassis. Exclusions are counted and
@@ -252,8 +257,8 @@ in this flavor**, unmodified:
 
 | What the backend calls | What it reads |
 |---|---|
-| `dcim/devices/` | the device list, filtered by the scope filter and paginated |
-| `extras/tags/`, `dcim/device-roles/`, `dcim/sites/` | whichever one `FEDELE_GROUP_SOURCE` selects becomes the device groups |
+| `dcim/devices/` | the device list, paginated, and filtered by the scope filter if one is set |
+| `extras/tags/`, `dcim/device-roles/`, `dcim/sites/` | whichever one `FEDELE_GROUP_SOURCE` selects becomes the device groups — always read unfiltered |
 | `device.primary_ip.address` | the SSH host, mask stripped |
 | `device.platform.name` | the Netmiko `device_type`, validated against `CLASS_MAPPER` |
 
@@ -586,7 +591,7 @@ absolute path or a `~` is taken as written.
 | `NETMIKO_MCP_INVENTORY_FILE` | *(netmiko-tools lookup)* | inventory path when the type is `yaml` |
 | `NETMIKO_MCP_CREDENTIAL_SOURCE` | `env` | `env` (reads the `.env`) or `fedele` |
 | `NETMIKO_MCP_FEDELE_GROUP_SOURCE` | `tags` | what defines a group: `tags`, `device_roles`, `sites` |
-| `NETMIKO_MCP_FEDELE_DEVICE_FILTER` | *(none)* | scope filter, `tag=lab&status=active`. Without it: the whole estate |
+| `NETMIKO_MCP_FEDELE_DEVICE_FILTER` | *(none)* | optional scope filter, `tag=lab&status=active`. Unset: the whole estate the token can read |
 | `NETMIKO_MCP_FEDELE_CACHE_TTL` | `60` | SoT resolution cache, in seconds |
 | `NETMIKO_MCP_COMMAND_FILE` | `~/commands.yml` outside Niko | allow/deny list |
 | `NETMIKO_MCP_ALLOW_PIPE` | `false` | enables pipes in commands |
