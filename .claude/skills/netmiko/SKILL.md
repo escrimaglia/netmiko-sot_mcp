@@ -14,9 +14,14 @@ description: >-
 ---
 
 > **Naming note (Claude Code).** This document refers to the tools as
-> `netmiko.<tool>`, which is how the server registers them. Claude Code exposes
-> them prefixed with the server name declared in `.mcp.json`: `mcp__netmiko__…`.
-> Run `/mcp` in the session to see the exact names.
+> `netmiko.<tool>`, which is how the server registers them. Claude Code rewrites
+> that name twice over: it prepends `mcp__` plus the server name declared in
+> `.mcp.json`, and it replaces the dot with an underscore, because a dot is not
+> legal in a tool name there. So `netmiko.get_metadata` reaches the model as
+> `mcp__netmiko__netmiko_get_metadata` — `netmiko` shows up twice, once as the
+> server name and once as the tool's own prefix, which is expected and not a
+> misconfiguration. Read every `netmiko.<tool>` below as that form. Run `/mcp` in
+> the session to see the exact names.
 
 # Netmiko — Read-Only Network Device Access
 
