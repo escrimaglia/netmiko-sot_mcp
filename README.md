@@ -52,32 +52,6 @@ and others — so that an operator can ask a question in plain language and have
 answered from the real estate: the SoT for what *should* be true, the devices
 themselves for what *is*.
 
-Inside Niko the same file runs a little differently, and that is worth knowing
-because it explains a few things in the code:
-
-- Servers run **over HTTP on loopback**, one port each, declared in
-  `mcps/mcp_config.json` with `url` / `transport` / `local` / `env` — the same
-  two-axis configuration described below, expressed in Niko's own format.
-- Installation goes through the app, not by copying files: the upload is
-  validated, the dependencies are resolved out of the code itself, and a failed
-  install rolls back instead of leaving half a server behind.
-
-Every one of those integrations is an **optional import with a fallback**, so
-`niko` never has to be installed. There are four, and this is what each degrades
-to when the import fails:
-
-| Import | Line | Standalone fallback |
-|---|---|---|
-| `niko.srvclass_logging.MCPLogging` | 60 | `NIKO_AVAILABLE = False`; the server configures its own `logging` |
-| `niko.niko_paths.NikoPaths` | 68 | `None`; paths come from the `NETMIKO_MCP_*` variables, which is why this project sets them explicitly |
-| `niko.srvclass_logging.SyncedConcurrentTimedRotatingFileHandler` | 436 | `FailClosedFileHandler` — still fail-closed, just not multi-process-safe |
-| `niko.srvclass_list_budget.apply_budget_to_payload` | 2709 | a no-op that returns the payload unchanged |
-
-Nothing is lost that matters outside Niko: the concurrent handler solves a
-several-processes-one-file problem that does not arise here, and the list budget
-trims long payloads for an agent that has its own context accounting. One file,
-two homes, no fork.
-
 `Fedele` is Niko's source of truth, which is why the SoT variables carry the
 `FEDELE_` prefix even when they point at a NetBox instance.
 
@@ -178,8 +152,6 @@ no file to edit and no restart.
 // .mcp.json → env
 "NETMIKO_MCP_INVENTORY_TYPE": "fedele",
 "NETMIKO_MCP_CREDENTIAL_SOURCE": "fedele"
-// GROUP_SOURCE (tags), DEVICE_FILTER (none) and CACHE_TTL (60s) keep their
-// defaults — the table below has them if you need to override one
 ```
 
 ```bash
@@ -211,16 +183,11 @@ Things worth knowing before you pick this flavor:
 - Without `FEDELE_CREDENTIALS_KEY` the server still starts, and **every** tool
   returns the same `Startup Error` naming the missing variable. It fails loudly,
   not silently.
-- **The inventory is the whole estate unless you scope it.** With no
-  `NETMIKO_MCP_FEDELE_DEVICE_FILTER` the agent can reach every device the SoT
-  exposes to your token, across every tenant. Running that way is a supported
+- **The inventory is the whole estate unless you scope it.**. Running that way is a supported
   posture, not a misconfiguration — the containment is then `commands.yml`,
   *which commands* are allowed rather than *which devices* are reachable. The
   server still logs a warning at startup and returns one in
-  `netmiko.get_metadata`; unscoped, that pair is expected output. To narrow it,
-  the filter takes query syntax: `tag=lab&status=active`. One caveat if you do:
-  it filters devices only — group listings are queried unfiltered, so
-  `netmiko.list_groups` stays global either way.
+  `netmiko.get_metadata`; unscoped, that pair is expected output.
 - A device without a `primary_ip`, without a `platform`, or whose platform is
   not a Netmiko `device_type` is **excluded** from the inventory — SoTs also
   inventory cameras, badge readers and chassis. Exclusions are counted and

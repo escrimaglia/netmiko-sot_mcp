@@ -66,41 +66,12 @@ if str(PARENT_DIR) not in sys.path:
     sys.path.insert(0, str(PARENT_DIR))
 load_dotenv(PARENT_DIR / ".env", override=False)
 
-# --- Postura del transporte HTTP -------------------------------------------
-#
-# Niko elige el transporte, no este archivo: srvclass_general.py:907 arma
-# `mcp.run(transport='http', host=..., port=...)` y no pasa ningún flag más, así
-# que TODO lo demás queda en los defaults de fastmcp — y los tres relevantes
-# vienen en False. El endpoint queda entonces escuchando en 127.0.0.1:8011/mcp
-# sin bearer token (invariante: el sondeo de arranque de Niko va sin headers, con
-# auth activa daría 401 y Niko concluiría que el server no levantó).
-#
-# Se fijan acá y NO como campos de McpConfig: test_transport_fields_are_gone
-# prohíbe que reaparezcan campos de transporte, porque reabrirían la puerta al
-# bearer token. Ninguno de estos tres agrega headers, así que no cae en eso.
-#
-# host_origin_protection: sin token, la validación de Host/Origin es la única
-#   defensa contra DNS rebinding — una página en el browser del operador resuelve
-#   su propio dominio a 127.0.0.1 y, siendo same-origin para el browser, llega al
-#   endpoint sin CORS de por medio y lee la respuesta. El Host ajeno es el único
-#   rastro que deja. En "auto" el guard valida Host porque el bind es loopback
-#   (permitidos: 127.0.0.1, localhost, ::1 y el host del bind) y responde 421 al
-#   ajeno; el Origin sólo se valida SI el header viene, así que un cliente que no
-#   es un browser —el de Niko— no lo nota. El default de fastmcp es False "for
-#   compatibility": es un opt-in, no algo que ya estuviera puesto.
-# stateless_http: un proceso local con un solo cliente no gana nada guardando
-#   estado de sesión, y sí paga que un reinicio del server invalide la sesión.
-# json_response: cada tool devuelve un resultado único (la salida grande se
-#   pagina en disco), así que el framing SSE no aporta y estorba al diagnosticar.
 TRANSPORT_POSTURE: dict[str, object] = {
     "http_host_origin_protection": "auto",
     "stateless_http": True,
     "json_response": True,
 }
 
-# Qué se pierde si la versión instalada de fastmcp no define el campo. El aviso
-# tiene que nombrar la consecuencia, no el nombre del campo: "no expone X" no le
-# dice a un operador si eso lo deja expuesto o si da igual.
 TRANSPORT_POSTURE_IF_MISSING: dict[str, str] = {
     "http_host_origin_protection": (
         "el endpoint HTTP no valida Host ni Origin, así que un endpoint sin bearer "
@@ -110,9 +81,6 @@ TRANSPORT_POSTURE_IF_MISSING: dict[str, str] = {
     "json_response": "las respuestas HTTP salen como stream SSE en vez de JSON",
 }
 
-# Los avisos se juntan acá porque `log` todavía no existe: la configuración del
-# logging necesita PARENT_DIR y el .env, que se resuelven arriba. Se emiten más
-# abajo, con el mismo patrón que log_file_error.
 transport_posture_warnings: list[str] = []
 
 
@@ -183,11 +151,6 @@ if NIKO_AVAILABLE:
     logg_inst = MCPLogging(log_file=os.getenv("LOG_FILE", "Niko.log"))
     log = logg_inst.setup_logging()
 else:
-    # Fuera de Niko no hay MCPLogging, pero LOG_FILE se declara igual en el
-    # .mcp.json: sin este handler la variable no haría nada y los logs sólo
-    # existirían mientras el cliente capture stderr. El StreamHandler es a
-    # stderr y nunca a stdout — stdout ES el canal JSON-RPC del transporte
-    # stdio, y una línea suelta ahí rompe la sesión.
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
     log_file_error: str | None = None
     log_file_setting = (os.getenv("LOG_FILE") or "").strip()
@@ -200,8 +163,6 @@ else:
                     log_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
                 )
             )
-            # 0600 igual que el audit trail: en DEBUG este archivo se lleva la
-            # salida de los dispositivos, running-configs incluidas.
             log_path.chmod(0o600)
         except OSError as exc:
             log_file_error = (
@@ -221,12 +182,6 @@ for posture_warning in transport_posture_warnings:
     log.warning(f"Transport: {posture_warning}")
 
 __VERSION__ = "0.1.7"
-# Revisión de ktbyers/netmiko_mcp contra la que se diffea la §7 SECURITY. Al
-# traer un parche de upstream, esa sección se revisa primero y se mantiene
-# literal. Verificado contra 951dfef: el único cambio en security.py desde
-# 2c05ff6 es cosmético (comillas de las forward refs de TrieNode), así que §7
-# está al día sin parche funcional pendiente.
-__UPSTREAM__ = "951dfef"
 MCP_NAME = "netmiko"
 MCPR_DIR = "mcpr"
 FALLBACK_COMMANDS_BY_PLATFORM: dict[str, list[str]] = {
@@ -989,8 +944,6 @@ def audit_files(since: datetime | None = None) -> list[Path]:
             continue
         if since_day and day is not None and day < since_day:
             continue
-        # The live file has no date suffix and holds today, so it gets a sentinel
-        # that sorts after every rotated day.
         selected.append((day or "9999-99-99", candidate))
 
     return [entry[1] for entry in sorted(selected)]
@@ -1202,10 +1155,6 @@ def run_audit_query(
             f"since='{since}' is later than until='{until}', so the window is empty."
         )
 
-    # Querying the audit writes a tool_invocation of its own, so a few questions in
-    # "the last 6 actions" would be six audit queries. The record stays — who read
-    # the trail is part of the trail — but it is out of the answer unless the
-    # caller asks for it, or filters for it on purpose.
     asked_for_self = filters.get("tool") == AUDIT_QUERY_TOOL_NAME
     exclude_tool = "" if (include_audit_queries or asked_for_self) else AUDIT_QUERY_TOOL_NAME
 
@@ -2149,14 +2098,6 @@ def load_commands() -> dict[str, Any]:
     if file_path.is_file():
         commands = load_yaml_file(str(file_path))
         if not isinstance(commands, dict):
-            # An existing-but-unusable file is NOT the fallback. The fallback answers
-            # "nobody wrote a policy yet"; a 0-byte or malformed commands.yml answers
-            # "somebody wrote one and it is broken", and widening the allow list on
-            # the strength of a broken file is exactly the wrong reflex. Raising here
-            # keeps the invariant this function owns — it returns a mapping or nothing
-            # at all — so no caller has to defend against None. validate_startup()
-            # turns it into a startup error that names the file, and every tool then
-            # reports that instead of touching a device.
             raise CommandPolicyError(
                 f"the file is empty or its top level is not a mapping "
                 f"(YAML parsed as {type(commands).__name__})"
