@@ -1,4 +1,4 @@
-# claude-project — netmiko MCP server + skill
+# claude-project — SoT netmiko MCP server + skill
 
 A ready-to-copy project that gives an AI agent **read-only access to routers,
 switches and firewalls over SSH**, through the Model Context Protocol.
